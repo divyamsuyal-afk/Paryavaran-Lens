@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paryavaran Lens</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root { --green:#1b7a43; --bg:#f5f7f5; --card:#fff; --text:#1c2a22; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { background:var(--green); color:#fff; padding:12px 16px; display:flex; justify-content:space-between; align-items:center; }
+  header h1 { font-size:1.15rem; margin:0; }
+  header label { font-size:.8rem; cursor:pointer; }
+  main { display:grid; grid-template-columns: 340px 1fr; height: calc(100vh - 80px); }
+  aside { padding:14px; overflow-y:auto; background:var(--card); border-right:1px solid #dde4de; }
+  #map { height:100%; }
+  h2 { font-size:1rem; margin:0 0 8px; }
+  input[type=file], select, textarea, button { width:100%; margin:6px 0; padding:9px; font:inherit; border-radius:8px; border:1px solid #c5cfc8; }
+  button { background:var(--green); color:#fff; border:0; cursor:pointer; }
+  button:disabled { opacity:.5; }
+  #preview { width:100%; border-radius:8px; display:none; margin-top:6px; }
+  #msg { font-size:.9rem; margin:6px 0; min-height:1.2em; }
+  .stats { display:flex; gap:6px; flex-wrap:wrap; margin:6px 0 14px; }
+  .chip { font-size:.75rem; background:#e8efe9; border-radius:999px; padding:3px 9px; }
+  .pop img { width:200px; border-radius:6px; display:block; margin-bottom:6px; }
+  .pop button { margin:2px 0; padding:5px; font-size:.8rem; }
+  .legend span { display:inline-block; margin-right:8px; font-size:.75rem; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:3px; }
+  @media (max-width:760px) { main { grid-template-columns:1fr; grid-template-rows:auto 55vh; height:auto; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>🌿 Paryavaran Lens</h1>
+  <label><input type="checkbox" id="adminMode"> Authority view (demo)</label>
+</header>
+<div id="banner" style="display:none;background:#fff3cd;color:#5c4400;padding:6px 16px;font-size:.8rem">DEMO MODE: no AWS backend connected. Problem type is NOT detected by AI here (uses your dropdown choice) and data stays in this browser tab. Set <code>API</code> in index.html to go live.</div>
+<main>
+  <aside>
+    <h2>Report a problem</h2>
+    <input type="file" id="photo" accept="image/*" capture="environment">
+    <img id="preview" alt="preview">
+    <select id="override">
+      <option value="">Let AI decide the problem type</option>
+      <option value="garbage_pile">Garbage pile</option>
+      <option value="blocked_drain">Blocked drain</option>
+      <option value="river_foam">River foam</option>
+      <option value="burning_waste">Burning waste</option>
+    </select>
+    <textarea id="note" rows="2" placeholder="Optional note (landmark, how long it's been there)"></textarea>
+    <button id="submit">Send report</button>
+    <div id="msg"></div>
+
+    <h2>Delhi at a glance</h2>
+    <div class="stats" id="stats"></div>
+    <div class="legend">
+      <span><i class="dot" style="background:#d32f2f"></i>Reported</span>
+      <span><i class="dot" style="background:#f57c00"></i>Forwarded</span>
+      <span><i class="dot" style="background:#1976d2"></i>In progress</span>
+      <span><i class="dot" style="background:#2e7d32"></i>Fixed</span>
+    </div>
+  </aside>
+  <div id="map"></div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+// 👉 Paste your API Gateway invoke URL below (no trailing slash). Leave as-is for demo mode.
+const API = "PASTE_YOUR_API_URL_HERE";
+const DEMO = API.startsWith("PASTE");
+if (DEMO) document.getElementById("banner").style.display = "block";
+
+const CATS = {
+  garbage_pile:{title:"Garbage pile",authority:"MCD"},
+  burning_waste:{title:"Burning waste",authority:"DPCC"},
+  river_foam:{title:"River foam / water pollution",authority:"DPCC / DJB"},
+  blocked_drain:{title:"Blocked drain",authority:"DJB"}
+};
+const now = Math.floor(Date.now()/1000);
+const seed = (id,lat,lng,c,status,ago,note)=>({id,lat,lng,category:c,...CATS[c],status,created:now-ago,note,photo_url:"data:image/svg+xml,"+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="200" height="120"><rect width="200" height="120" fill="#e8efe9"/><text x="100" y="65" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#555">sample photo</text></svg>')});
+let mockDb = [
+  seed("s1",28.6129,77.2295,"garbage_pile","reported",86400*3,"Near India Gate lawns (sample)"),
+  seed("s2",28.6670,77.2480,"river_foam","forwarded",86400*2,"Yamuna near ITO (sample)"),
+  seed("s3",28.5355,77.2100,"blocked_drain","in_progress",86400*5,"Saket market (sample)"),
+  seed("s4",28.7041,77.1025,"burning_waste","fixed",86400*8,"Rohini (sample)")
+];
+
+// Router handling both Demo and Real API modes
+async function api(path, method = "GET", body) {
+  if (!DEMO) {
+    const r = await fetch(API + path, { method, headers: {"Content-Type":"application/json"}, body: body && JSON.stringify(body) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "Request failed");
+    return d;
+  }
+  
+  if (method === "GET" && (path === "/reports" || path === "/report")) {
+    return mockDb.slice().sort((a,b)=>b.created-a.created);
+  }
+  if (path === "/report" && method === "POST") {
+    const c = body.category_override || "garbage_pile";
+    const item = { 
+      id: Math.random().toString(36).slice(2,10), 
+      lat: body.lat, 
+      lng: body.lng, 
+      category: c, 
+      ...CATS[c],
+      status: "forwarded", 
+      created: Math.floor(Date.now()/1000), 
+      note: body.note,
+      photo_url: "data:image/jpeg;base64," + body.image_base64 
+    };
+    mockDb.push(item);
+    return item;
+  }
+  const m = path.match(/^\/report\/(.+)\/status$/);
+  if (m && method === "POST") {
+    const it = mockDb.find(x => x.id === m[1]);
+    if (it) { it.status = body.status; return it; }
+  }
+  throw new Error("Route not found");
+}
+
+const COLORS = { reported:"#d32f2f", forwarded:"#f57c00", in_progress:"#1976d2", fixed:"#2e7d32" };
+const NEXT = { reported:"forwarded", forwarded:"in_progress", in_progress:"fixed" };
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+const map = L.map("map").setView([28.6139, 77.2090], 11);
+
+// Free, public map tiles without API keys or blocking
+// Map tiles: Esri World Street Map (no API key, works even when the page is opened as a local file)
+L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}", {
+  attribution: "Tiles &copy; Esri",
+  maxZoom: 19
+}).addTo(map);
+
+const layer = L.layerGroup().addTo(map);
+let reports = [];
+
+function compress(file, maxSide = 1024) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = img.width * scale; c.height = img.height * scale;
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      resolve(c.toDataURL("image/jpeg", 0.8).split(",")[1]);
+    };
+    img.onerror = reject;
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+const getLocation = () => new Promise((res) =>
+  navigator.geolocation.getCurrentPosition(
+    p => res(p.coords), 
+    () => res({ latitude: 28.6139, longitude: 77.2090 }),
+    { enableHighAccuracy: true, timeout: 5000 }
+  )
+);
+
+// Read GPS location stored inside a photo (EXIF). Returns {lat, lng} or null.
+async function readGps(file) {
+  try {
+    const v = new DataView(await file.slice(0, 262144).arrayBuffer());
+    if (v.getUint16(0) !== 0xFFD8) return null;           // not a JPEG
+    let off = 2;
+    while (off + 4 < v.byteLength) {
+      const marker = v.getUint16(off);
+      if ((marker & 0xFF00) !== 0xFF00) return null;
+      if (marker === 0xFFE1 && v.getUint32(off + 4) === 0x45786966) return parseExifGps(v, off + 10);
+      off += 2 + v.getUint16(off + 2);
+    }
+  } catch (e) { console.warn("EXIF read failed", e); }
+  return null;
+}
+function parseExifGps(v, tiff) {
+  const le = v.getUint16(tiff) === 0x4949;
+  const u16 = o => v.getUint16(o, le), u32 = o => v.getUint32(o, le);
+  const ifd0 = tiff + u32(tiff + 4);
+  let gpsOff = null;
+  for (let i = 0, n = u16(ifd0); i < n; i++) {
+    const e = ifd0 + 2 + i * 12;
+    if (u16(e) === 0x8825) gpsOff = tiff + u32(e + 8);
+  }
+  if (gpsOff === null) return null;
+  const g = {};
+  for (let i = 0, n = u16(gpsOff); i < n; i++) {
+    const e = gpsOff + 2 + i * 12, tag = u16(e);
+    if (tag === 1 || tag === 3) g[tag] = String.fromCharCode(v.getUint8(e + 8));
+    else if (tag === 2 || tag === 4) {
+      const p = tiff + u32(e + 8);
+      const r = k => u32(p + k * 8) / (u32(p + k * 8 + 4) || 1);
+      g[tag] = r(0) + r(1) / 60 + r(2) / 3600;
+    }
+  }
+  if (g[2] === undefined || g[4] === undefined) return null;
+  const lat = (g[1] === "S" ? -1 : 1) * g[2], lng = (g[3] === "W" ? -1 : 1) * g[4];
+  if (!isFinite(lat) || !isFinite(lng) || (lat === 0 && lng === 0)) return null;
+  return { lat, lng };
+}
+
+$("photo").onchange = async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $("preview").src = URL.createObjectURL(f);
+  $("preview").style.display = "block";
+  const gps = await readGps(f);
+  $("msg").textContent = gps
+    ? `📍 Photo location found: ${gps.lat.toFixed(5)}, ${gps.lng.toFixed(5)}`
+    : "No location inside this photo, so your device location will be used.";
+};
+
+$("submit").onclick = async () => {
+  const file = $("photo").files[0];
+  if (!file) { $("msg").textContent = "Please take or choose a photo first."; return; }
+  $("submit").disabled = true;
+  try {
+    $("msg").textContent = "Reading photo location…";
+    const gps = await readGps(file);
+    let lat, lng, where;
+    if (gps) { lat = gps.lat; lng = gps.lng; where = "location from photo"; }
+    else { const pos = await getLocation(); lat = pos.latitude; lng = pos.longitude; where = "photo had no location, used your device location"; }
+    $("msg").textContent = "Analysing photo…";
+    const body = {
+      image_base64: await compress(file),
+      lat, lng,
+      note: $("note").value,
+      category_override: $("override").value || undefined
+    };
+    const d = await api("/report", "POST", body);
+    $("msg").textContent = DEMO ? `✅ Saved as: ${d.title} → ${d.authority} (demo mode, no AI)` : `✅ Detected: ${d.title}. Sent to ${d.authority}. (${where})`;
+    $("photo").value = ""; $("preview").style.display = "none"; $("note").value = "";
+    await load();
+    map.setView([d.lat, d.lng], 15);
+  } catch (e) {
+    $("msg").textContent = "⚠️ " + e.message;
+  }
+  $("submit").disabled = false;
+};
+
+async function setStatus(id, status) {
+  await api(`/report/${id}/status`, "POST", { status });
+  load();
+}
+window.setStatus = setStatus;
+
+function render() {
+  layer.clearLayers();
+  const admin = $("adminMode").checked;
+  const counts = {};
+  reports.forEach(r => {
+    counts[r.title] = (counts[r.title] || 0) + 1;
+    const when = new Date(r.created * 1000).toLocaleString("en-IN");
+    const btn = admin && NEXT[r.status]
+      ? `<button onclick="setStatus('${esc(r.id)}','${NEXT[r.status]}')">Mark as ${NEXT[r.status].replace("_"," ")}</button>` : "";
+    L.circleMarker([r.lat, r.lng], { radius: 9, color: "#fff", weight: 2, fillColor: COLORS[r.status] || "#777", fillOpacity: .95 })
+      .bindPopup(`<div class="pop"><img src="${esc(r.photo_url)}" alt="">
+        <b>${esc(r.title)}</b><br>Authority: ${esc(r.authority)}<br>
+        Status: <b>${esc(r.status.replace("_"," "))}</b><br><small>${esc(when)}</small>
+        ${r.note ? `<br><i>${esc(r.note)}</i>` : ""}${btn}</div>`)
+      .addTo(layer);
+  });
+  $("stats").innerHTML = `<span class="chip">${reports.length} total</span>` +
+    Object.entries(counts).map(([k, v]) => `<span class="chip">${esc(k)}: ${v}</span>`).join("");
+}
+$("adminMode").onchange = render;
+
+async function load() {
+  try {
+    reports = await api("/reports");
+    render();
+  } catch (err) { console.error("Load reports failed:", err); $("msg").textContent = "⚠️ Could not load reports (" + err.message + ")"; }
+}
+load();
+</script>
+</body>
+</html>
